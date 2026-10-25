@@ -31,10 +31,14 @@ main:
 
 ## 语言子集
 
-- 关键字：`int`、`return`
+- 关键字：`int`、`return`、`if`、`else`、`while`
 - 标识符、十进制整数字面量
-- 运算符：`+ - * /`（含一元负号 ` -`）、赋值 `=`；分隔符 `( ) { } ; ,`
+- 运算符：`+ - * /`（含一元负号 `-`）、比较 `== != < <= > >=`、赋值 `=`；
+  分隔符 `( ) { } ; ,`
 - 变量声明（`int a = 10;`）、函数定义（`int add(int x, int y) { ... }`）、函数调用
+- 控制流：`if (cond) stmt else stmt`、`while (cond) stmt`、语句块 `{ ... }`
+  （支持任意嵌套；`else` 与最近的未配对 `if` 绑定）
+- 表达式语句（如 `sum = sum + i;`）；赋值表达式本身有值，可嵌套
 - 顶层语句自动包装进合成 `main`（已有显式 `main` 则直接使用）
 - `//` 与 `/* */` 注释
 
@@ -84,12 +88,16 @@ npm test
 
 ```
 $ npm test
-=== case: basic (expect exit 30) ===        PASS
-=== case: funcs (expect exit 15) ===        PASS
-=== case: precedence (expect exit 14) ===   PASS
-=== case: div_neg (expect exit -7) ===      PASS
-=== case: stack_args (expect exit 15) ===   PASS
-ALL TESTS PASSED (5/5)
+=== case: basic (expect exit 30) ===           PASS
+=== case: funcs (expect exit 15) ===           PASS
+=== case: precedence (expect exit 14) ===      PASS
+=== case: div_neg (expect exit -7) ===         PASS
+=== case: stack_args (expect exit 15) ===      PASS
+=== case: if_true (expect exit 42) ===         PASS
+=== case: if_else_false (expect exit 2) ===    PASS
+=== case: while_sum (expect exit 55) ===       PASS
+=== case: comparison_values (expect exit 2) ===PASS
+ALL TESTS PASSED (9/9)
 ```
 
 `npm test` 的流程：`compileSource()` 生成 `build/<case>.s` → `as` 汇编为
@@ -124,11 +132,21 @@ gcc examples/funcs.s -o funcs && ./funcs; echo $?   # 期望 15
 
 - **词法**：单遍扫描，token 带 `line/col`，错误信息含源码位置。
 - **语法**：递归下降 + 一级 lookahead 回溯区分「函数定义 vs 变量声明」
-  （`int IDENT (` 为函数，否则为声明）。
-- **语义**：重复定义检查、未定义标识符检查、`main` 冲突检查。
+  （`int IDENT (` 为函数，否则为声明）。比较运算优先级低于算术、
+  相等低于关系，均左结合（与 C 一致）；赋值最低且右结合，左值仅限标识符。
+- **语义**：递归遍历嵌套块/控制流做重复定义与未定义标识符检查、
+  `main` 冲突检查。
 - **代码生成**：每个函数一个栈帧；参数与局部变量统一放 `[rbp-8k]` 槽位
-  （入口处从寄存器溢出）；每个二元运算节点独占一个 temp 槽（表达式求值
-  结果全程在寄存器，不做表达式压栈，栈对齐始终干净）。
+  （入口处从寄存器溢出，嵌套块中的声明一并收入函数级帧）；每个二元运算
+  节点独占一个 temp 槽（表达式求值结果全程在寄存器，不做表达式压栈，
+  栈对齐始终干净）。
+- **控制流**：`if/else`、`while` 用全程序单计数器分配的 `.L<n>` 标签 +
+  `cmp/je/jne/jmp` 跳转实现；条件求值采用 setCC 风格（`cmpq` 置标志后
+  `setCC %al` + `movzbl` 物化为 0/1），同一条件既可作跳转测试也可作普通
+  表达式值。
+- **负数正确性**：局部变量载入用 `movslq` 符号扩展、一元负号用 `negq`、
+  除法用 `cqto` 扩展 128 位被除数——所有算术与 `cmpq` 均按 64 位有符号
+  处理，避免零扩展把负数变成巨大的无符号值。
 
 ## 未来计划 / TODO
 
@@ -137,7 +155,7 @@ gcc examples/funcs.s -o funcs && ./funcs; echo $?   # 期望 15
   `rdi/rsi/rdx/rcx/r8/r9`（第 7 个参数起入栈）、取消 32 字节 shadow
   space，使 `funcs`、`stack_args` 等含函数调用的用例能在 Linux 原生 gcc
   下直接编译执行，无需 MinGW 交叉工具链。
-- 更多语言特性：`if/else`、`while/for`、比较与逻辑运算、`char` 与指针、
+- 更多语言特性：`for` 循环、逻辑运算符（`&& || !`）、`char` 与指针、
   局部变量作用域屏蔽。
 - 寄存器分配：当前每个二元运算独占一个 temp 槽，改为按需复用可缩小帧。
 - 编译期常量折叠等窥孔优化。

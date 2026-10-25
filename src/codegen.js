@@ -133,7 +133,9 @@ function emitExpr(node, ctx) {
         case '-': P(`    subq    %rbx, %rax`); break;
         case '*': P(`    imulq   %rbx, %rax`); break;
         case '/':
-          P(`    cdq`);
+          // cqto sign-extends rax into rdx:rax, the 128-bit dividend
+          // idivq expects. (cdq would leave garbage in rdx's upper half.)
+          P(`    cqto`);
           P(`    idivq   %rbx`);
           break;
         // cmpq computes rax - rbx; setCC reads those flags (signed).

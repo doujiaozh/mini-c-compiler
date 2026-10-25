@@ -9,9 +9,9 @@ main:
 
     movl    $10, -8(%rbp)
     movl    $20, -16(%rbp)
-    movl    -8(%rbp), %eax
+    movslq  -8(%rbp), %rax
     movq    %rax, -24(%rbp)
-    movl    -16(%rbp), %eax
+    movslq  -16(%rbp), %rax
     movq    %rax, %rbx
     movq    -24(%rbp), %rax
     addq    %rbx, %rax

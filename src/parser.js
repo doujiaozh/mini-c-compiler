@@ -6,11 +6,20 @@
  *
  * Grammar (mini-C):
  *   program    : item*
- *   item       : funcDef | varDecl | returnStmt
- *   funcDef    : 'int' IDENT '(' [ 'int' IDENT (',' 'int' IDENT)* ] ')' '{' item* '}'
+ *   item       : funcDef | statement
+ *   funcDef    : 'int' IDENT '(' [ 'int' IDENT (',' 'int' IDENT)* ] ')' '{' statement* '}'
+ *   statement  : varDecl | returnStmt | ifStmt | whileStmt | block | exprStmt
  *   varDecl    : 'int' IDENT ['=' expr] ';'
  *   returnStmt : 'return' expr? ';'
- *   expr       : additive
+ *   ifStmt     : 'if' '(' expr ')' statement ['else' statement]
+ *   whileStmt  : 'while' '(' expr ')' statement
+ *   block      : '{' statement* '}'
+ *   exprStmt   : expr ';'
+ *   expr       : assignment
+ *   assignment : IDENT '=' assignment
+ *               | equality
+ *   equality   : relational (('==' | '!=') relational)*
+ *   relational : additive (('<' | '<=' | '>' | '>=') additive)*
  *   additive   : multiplicative (('+' | '-') multiplicative)*
  *   multiplicative : unary (('*' | '/') unary)*
  *   unary      : '-' unary | primary
@@ -18,6 +27,11 @@
  *
  * Disambiguation: after `int IDENT` a '(' means a function definition,
  * otherwise it is a variable declaration.
+ *
+ * Comparison operators bind looser than arithmetic, equality looser
+ * than relational (same shape as C, left-associative).
+ * Assignment is right-associative and syntax-restricted to a plain
+ * identifier on the left (the only lvalue in this subset).
  *
  * A program may also be a bare list of statements (the MVP test case);
  * wrapProgram() lifts those into a synthesized `main`.
@@ -107,14 +121,17 @@ class Parser {
       this.i = saved;
       return isFuncDef ? this.parseFuncDef() : this.parseVarDecl();
     }
-    if (this.isKw('return')) return this.parseReturn();
-    throw new ParseError(`unexpected token '${this.describe()}'`, this.peek());
+    return this.parseStatement();
   }
 
-  parseItemInFunc() {
+  /** Any statement: declarations, returns, control flow, blocks, expressions. */
+  parseStatement() {
     if (this.isKw('int')) return this.parseVarDecl();
     if (this.isKw('return')) return this.parseReturn();
-    throw new ParseError(`unexpected token '${this.describe()}' in function body`, this.peek());
+    if (this.isKw('if')) return this.parseIf();
+    if (this.isKw('while')) return this.parseWhile();
+    if (this.isOp('{')) return this.parseBlock();
+    return this.parseExprStmt();
   }
 
   parseFuncDef() {
@@ -140,10 +157,50 @@ class Parser {
     const body = [];
     while (!this.isOp('}')) {
       if (this.atEOF()) throw new ParseError(`unterminated function body of '${nameTok.value}'`);
-      body.push(this.parseItemInFunc());
+      body.push(this.parseStatement());
     }
     this.eatOp('}');
     return { type: 'FuncDef', name: nameTok.value, params, body, line: nameTok.line };
+  }
+
+  parseIf() {
+    this.eatKw('if');
+    this.eatOp('(');
+    const cond = this.parseExpr();
+    this.eatOp(')');
+    const then = this.parseStatement();
+    let el = null;
+    if (this.isKw('else')) {
+      this.next();
+      el = this.parseStatement(); // dangling-else binds to the innermost if
+    }
+    return { type: 'If', cond, then, else: el };
+  }
+
+  parseWhile() {
+    this.eatKw('while');
+    this.eatOp('(');
+    const cond = this.parseExpr();
+    this.eatOp(')');
+    const body = this.parseStatement();
+    return { type: 'While', cond, body };
+  }
+
+  parseBlock() {
+    this.eatOp('{');
+    const body = [];
+    while (!this.isOp('}')) {
+      if (this.atEOF()) throw new ParseError('unterminated block');
+      body.push(this.parseStatement());
+    }
+    this.eatOp('}');
+    return { type: 'Block', body };
+  }
+
+  parseExprStmt() {
+    const expr = this.parseExpr();
+    this.eatOp(';');
+    return { type: 'ExprStmt', expr };
   }
 
   parseVarDecl() {
@@ -170,7 +227,40 @@ class Parser {
   }
 
   parseExpr() {
-    return this.parseAdditive();
+    return this.parseAssignment();
+  }
+
+  /** assignment : IDENT '=' assignment | equality  (right-associative). */
+  parseAssignment() {
+    const t = this.peek();
+    const t2 = this.peek(1);
+    if (t.type === 'IDENT' && t2.type === 'OP' && t2.value === '=') {
+      this.next(); // IDENT
+      this.next(); // '='
+      const value = this.parseAssignment();
+      return { type: 'Assign', name: t.value, value, line: t.line };
+    }
+    return this.parseEquality();
+  }
+
+  parseEquality() {
+    let left = this.parseRelational();
+    while (this.isOp('==') || this.isOp('!=')) {
+      const op = this.next().value;
+      const right = this.parseRelational();
+      left = { type: 'BinaryOp', op, left, right };
+    }
+    return left;
+  }
+
+  parseRelational() {
+    let left = this.parseAdditive();
+    while (this.isOp('<') || this.isOp('<=') || this.isOp('>') || this.isOp('>=')) {
+      const op = this.next().value;
+      const right = this.parseAdditive();
+      left = { type: 'BinaryOp', op, left, right };
+    }
+    return left;
   }
 
   parseAdditive() {
@@ -277,17 +367,45 @@ function analyzeFunc(func, funcs) {
     seen.add(p);
     scope.set(p, 'param');
   }
-  for (const stmt of func.body) {
-    if (stmt.type === 'VarDecl') {
+  for (const stmt of func.body) analyzeStmt(stmt, scope, seen, funcs, func.name);
+}
+
+/**
+ * Statements nest (if/while bodies, blocks), so name resolution walks the
+ * tree. Declarations stay function-scoped: a VarDecl anywhere in the body
+ * extends the single flat scope, and shadowing between blocks is rejected
+ * as a duplicate.
+ */
+function analyzeStmt(stmt, scope, seen, funcs, fname) {
+  switch (stmt.type) {
+    case 'VarDecl':
       if (seen.has(stmt.name)) {
-        throw new SemanticError(`duplicate declaration of '${stmt.name}' in ${func.name}`);
+        throw new SemanticError(`duplicate declaration of '${stmt.name}' in ${fname}`);
       }
       seen.add(stmt.name);
       scope.set(stmt.name, 'local');
-      walkExpr(stmt.init, scope, funcs, func.name);
-    } else if (stmt.type === 'Return') {
-      walkExpr(stmt.expr, scope, funcs, func.name);
-    }
+      walkExpr(stmt.init, scope, funcs, fname);
+      return;
+    case 'Return':
+      walkExpr(stmt.expr, scope, funcs, fname);
+      return;
+    case 'ExprStmt':
+      walkExpr(stmt.expr, scope, funcs, fname);
+      return;
+    case 'If':
+      walkExpr(stmt.cond, scope, funcs, fname);
+      analyzeStmt(stmt.then, scope, seen, funcs, fname);
+      if (stmt.else) analyzeStmt(stmt.else, scope, seen, funcs, fname);
+      return;
+    case 'While':
+      walkExpr(stmt.cond, scope, funcs, fname);
+      analyzeStmt(stmt.body, scope, seen, funcs, fname);
+      return;
+    case 'Block':
+      for (const s of stmt.body) analyzeStmt(s, scope, seen, funcs, fname);
+      return;
+    default:
+      throw new SemanticError(`unknown statement node '${stmt.type}' in ${fname}`);
   }
 }
 
@@ -303,6 +421,12 @@ function walkExpr(e, scope, funcs, fname) {
       return;
     case 'UnaryOp':
       walkExpr(e.operand, scope, funcs, fname);
+      return;
+    case 'Assign':
+      if (!scope.has(e.name)) {
+        throw new SemanticError(`assignment to unknown identifier '${e.name}' in ${fname}`);
+      }
+      walkExpr(e.value, scope, funcs, fname);
       return;
     case 'BinaryOp':
       walkExpr(e.left, scope, funcs, fname);

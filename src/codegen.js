@@ -19,11 +19,20 @@
  * while evaluating the RHS (no stack pushes for expression state, so stack
  * alignment stays 16-byte clean even with nested calls).
  *
+ * Control flow (if / else / while) uses `.L<n>` labels from a single
+ * program-wide counter, so labels never collide between functions.
+ * Comparisons are setCC-style: `cmpq` sets the flags, `setCC %al` +
+ * `movzbl` materialises a 0/1 int in eax, so a condition works both as a
+ * jump test (`cmpl $0, %eax; je ...`) and as a plain expression value.
+ *
  * Directives are kept minimal (.file / .section / .globl) so the same
  * file assembles on both PE-COFF (Windows/MinGW) and ELF (Linux) targets.
  */
 
 const ARG_REGS = ['rcx', 'rdx', 'r8', 'r9'];
+
+/** Relational/equality operators: emit cmpq + setCC and a 0/1 result. */
+const COMPARISON_OPS = new Set(['==', '!=', '<', '<=', '>', '>=']);
 
 class CodegenError extends Error {
   constructor(message) {
@@ -39,6 +48,8 @@ function countBinaryOps(node, acc) {
       return countBinaryOps(node.right, countBinaryOps(node.left, acc + 1));
     case 'UnaryOp':
       return countBinaryOps(node.operand, acc);
+    case 'Assign':
+      return countBinaryOps(node.value, acc);
     case 'Call': {
       let a = acc;
       for (const arg of node.args) a = countBinaryOps(arg, a);
@@ -49,13 +60,32 @@ function countBinaryOps(node, acc) {
   }
 }
 
-function countFuncBinaryOps(func) {
-  let n = 0;
-  for (const stmt of func.body) {
-    if (stmt.type === 'VarDecl') n = countBinaryOps(stmt.init, n);
-    else if (stmt.type === 'Return') n = countBinaryOps(stmt.expr, n);
+/** Statements nest (if/while/block bodies), so temp-slot counting recurses. */
+function countStmtBinaryOps(stmt, acc) {
+  switch (stmt.type) {
+    case 'VarDecl':
+      return countBinaryOps(stmt.init, acc);
+    case 'Return':
+      return countBinaryOps(stmt.expr, acc);
+    case 'ExprStmt':
+      return countBinaryOps(stmt.expr, acc);
+    case 'If': {
+      let a = countBinaryOps(stmt.cond, acc);
+      a = countStmtBinaryOps(stmt.then, a);
+      if (stmt.else) a = countStmtBinaryOps(stmt.else, a);
+      return a;
+    }
+    case 'While':
+      return countStmtBinaryOps(stmt.body, countBinaryOps(stmt.cond, acc));
+    case 'Block':
+      return stmt.body.reduce((a, s) => countStmtBinaryOps(s, a), acc);
+    default:
+      throw new CodegenError(`unsupported statement '${stmt.type}'`);
   }
-  return n;
+}
+
+function countFuncBinaryOps(func) {
+  return func.body.reduce((a, s) => countStmtBinaryOps(s, a), 0);
 }
 
 function emitExpr(node, ctx) {
@@ -67,15 +97,29 @@ function emitExpr(node, ctx) {
 
     case 'Ident': {
       const off = ctx.localOff(node.name);
-      P(`    movl    -${off}(%rbp), %eax`);
+      // Sign-extend the 32-bit slot to the full register: arithmetic and
+      // cmpq below are 64-bit signed, and zero-extension would turn
+      // negatives into huge unsigned values (and break `< 0` etc.).
+      P(`    movslq  -${off}(%rbp), %rax`);
       break;
     }
 
     case 'UnaryOp':
       if (node.op !== '-') throw new CodegenError(`unsupported unary op '${node.op}'`);
       emitExpr(node.operand, ctx);
-      P(`    negl    %eax`);
+      // Full-register negate keeps the sign extension intact (negl would
+      // zero the upper half and turn -3 into 4294967293 for cmpq/idivq).
+      P(`    negq    %rax`);
       break;
+
+    case 'Assign': {
+      // Right side first; eax keeps the value, which is also the result of
+      // the assignment expression.
+      emitExpr(node.value, ctx);
+      const off = ctx.localOff(node.name);
+      P(`    movl    %eax, -${off}(%rbp)`);
+      break;
+    }
 
     case 'BinaryOp': {
       const toff = ctx.tempOff(ctx.nextTemp());
@@ -92,9 +136,17 @@ function emitExpr(node, ctx) {
           P(`    cdq`);
           P(`    idivq   %rbx`);
           break;
+        // cmpq computes rax - rbx; setCC reads those flags (signed).
+        case '==': P(`    cmpq    %rbx, %rax`); P(`    sete    %al`); break;
+        case '!=': P(`    cmpq    %rbx, %rax`); P(`    setne   %al`); break;
+        case '<': P(`    cmpq    %rbx, %rax`); P(`    setl    %al`); break;
+        case '<=': P(`    cmpq    %rbx, %rax`); P(`    setle   %al`); break;
+        case '>': P(`    cmpq    %rbx, %rax`); P(`    setg    %al`); break;
+        case '>=': P(`    cmpq    %rbx, %rax`); P(`    setge   %al`); break;
         default:
           throw new CodegenError(`unsupported binary op '${node.op}'`);
       }
+      if (COMPARISON_OPS.has(node.op)) P(`    movzbl  %al, %eax`); // 0/1, zeroes upper bits
       break;
     }
 
@@ -131,12 +183,99 @@ function emitCall(node, ctx) {
   P(`    addq    $${total}, %rsp`);
 }
 
-function emitFunction(func, push) {
+/** Collect declared names from every (possibly nested) block into one
+ *  function-level frame. Same flat lifetime as the semantic scope. */
+function collectLocals(stmt, locals) {
+  switch (stmt.type) {
+    case 'VarDecl':
+      locals.push(stmt.name);
+      return;
+    case 'If':
+      collectLocals(stmt.then, locals);
+      if (stmt.else) collectLocals(stmt.else, locals);
+      return;
+    case 'While':
+      collectLocals(stmt.body, locals);
+      return;
+    case 'Block':
+      for (const s of stmt.body) collectLocals(s, locals);
+      return;
+    default:
+      return;
+  }
+}
+
+function emitStmt(stmt, ctx, epilogue) {
+  const P = (s) => ctx.push(s);
+  switch (stmt.type) {
+    case 'VarDecl':
+      if (stmt.init === null) return;
+      {
+        const off = ctx.localOff(stmt.name);
+        if (stmt.init.type === 'NumLit') {
+          P(`    movl    $${stmt.init.value}, -${off}(%rbp)`);
+        } else {
+          emitExpr(stmt.init, ctx);
+          P(`    movl    %eax, -${off}(%rbp)`);
+        }
+      }
+      return;
+
+    case 'Return':
+      if (stmt.expr) emitExpr(stmt.expr, ctx);
+      else P(`    xorl    %eax, %eax`);
+      P('');
+      epilogue();
+      return;
+
+    case 'ExprStmt':
+      emitExpr(stmt.expr, ctx);
+      return;
+
+    case 'If': {
+      const end = ctx.nextLabel();
+      const elseL = stmt.else ? ctx.nextLabel() : end;
+      emitExpr(stmt.cond, ctx);
+      P(`    cmpl    $0, %eax`); // false => jump
+      P(`    je      ${elseL}`);
+      emitStmt(stmt.then, ctx, epilogue);
+      if (stmt.else) {
+        P(`    jmp     ${end}`);
+        P(`${elseL}:`);
+        emitStmt(stmt.else, ctx, epilogue);
+      }
+      P(`${end}:`);
+      return;
+    }
+
+    case 'While': {
+      const cond = ctx.nextLabel();
+      const end = ctx.nextLabel();
+      P(`${cond}:`);
+      emitExpr(stmt.cond, ctx);
+      P(`    cmpl    $0, %eax`);
+      P(`    je      ${end}`);
+      emitStmt(stmt.body, ctx, epilogue);
+      P(`    jmp     ${cond}`);
+      P(`${end}:`);
+      return;
+    }
+
+    case 'Block':
+      for (const s of stmt.body) emitStmt(s, ctx, epilogue);
+      return;
+
+    default:
+      throw new CodegenError(`unsupported statement '${stmt.type}'`);
+  }
+}
+
+function emitFunction(func, push, nextLabel) {
   // Parameters are the first "locals": the prologue spills them from the
   // argument registers into frame slots, after which codegen is uniform.
   const locals = [];
   for (const p of func.params) locals.push(p);
-  for (const s of func.body) if (s.type === 'VarDecl') locals.push(s.name);
+  for (const s of func.body) collectLocals(s, locals);
   const nslots = locals.length;
   const ntemps = countFuncBinaryOps(func);
   const frame = Math.ceil((8 * (nslots + ntemps) + 8) / 16) * 16;
@@ -147,6 +286,7 @@ function emitFunction(func, push) {
     tempOff: (t) => 8 * (nslots + t + 1),
     tempIdx: 0,
     nextTemp: () => ctx.tempIdx++,
+    nextLabel,
   };
 
   push(`    .globl  ${func.name}`);
@@ -175,23 +315,7 @@ function emitFunction(func, push) {
     push(`    ret`);
   };
 
-  for (const stmt of func.body) {
-    if (stmt.type === 'VarDecl') {
-      if (stmt.init === null) continue;
-      const off = ctx.localOff(stmt.name);
-      if (stmt.init.type === 'NumLit') {
-        push(`    movl    $${stmt.init.value}, -${off}(%rbp)`);
-      } else {
-        emitExpr(stmt.init, ctx);
-        push(`    movl    %eax, -${off}(%rbp)`);
-      }
-    } else if (stmt.type === 'Return') {
-      if (stmt.expr) emitExpr(stmt.expr, ctx);
-      else push(`    xorl    %eax, %eax`);
-      push('');
-      epilogue();
-    }
-  }
+  for (const stmt of func.body) emitStmt(stmt, ctx, epilogue);
 
   // Fall through: implicit return 0 (only if the body does not end in `return`).
   const last = func.body[func.body.length - 1];
@@ -205,12 +329,17 @@ function emitFunction(func, push) {
 function generateAssembly(program) {
   const lines = [];
   const push = (s) => lines.push(s);
+  // One label sequence for the whole translation unit: `.L` labels are
+  // file-scoped in GNU as, so sharing the counter prevents collisions
+  // between functions.
+  let labelSeq = 0;
+  const nextLabel = () => `.L${labelSeq++}`;
 
   push('    .file   "main.s"');
   push('    .section .text');
   push('');
   for (const func of program.body) {
-    emitFunction(func, push);
+    emitFunction(func, push, nextLabel);
     push('');
   }
 

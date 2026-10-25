@@ -79,6 +79,47 @@ int main() {
 `,
     expect: 15,
   },
+  {
+    // if with a true condition: control flow + `>` comparison, exit 42.
+    name: 'if_true',
+    source: `int a = 10;
+if (a > 5) return 42;
+return 0;
+`,
+    expect: 42,
+  },
+  {
+    // if/else, condition false via `!=`: jumps past the `jmp end`.
+    name: 'if_else_false',
+    source: `int x = 0;
+if (x != 0) return 1; else return 2;
+return 99;
+`,
+    expect: 2,
+  },
+  {
+    // while loop with an assignments-in-block body: 1+2+...+10.
+    name: 'while_sum',
+    source: `int sum = 0;
+int i = 1;
+while (i <= 10) {
+  sum = sum + i;
+  i = i + 1;
+}
+return sum;
+`,
+    expect: 55,
+  },
+  {
+    // Comparisons are expressions yielding 0/1: 1 + 1 - 0 = 2.
+    name: 'comparison_values',
+    source: `int a = 5;
+int b = 3;
+int c = (a > b) + (a == 5) - (a != a);
+return c;
+`,
+    expect: 2,
+  },
 ];
 
 /** Normalize a process exit code to a signed 32-bit int. */

@@ -4,15 +4,18 @@
  * Lexer: turns mini-C source text into a flat token stream.
  *
  * Supported:
- *   - keywords: int, return
+ *   - keywords: int, return, if, else, while
  *   - identifiers: [A-Za-z_][A-Za-z0-9_]*
  *   - decimal integer literals
- *   - operators / punctuation: + - * / ( ) , = ; { }
+ *   - operators / punctuation: + - * / ( ) , = ; { } < >
+ *     comparisons (two characters): == != <= >=
  *   - whitespace, // line comments, /* ... *\/ block comments
  */
 
-const KEYWORDS = new Set(['int', 'return']);
-const OPS = new Set(['+', '-', '*', '/', '(', ')', ',', '=', ';', '{', '}']);
+const KEYWORDS = new Set(['int', 'return', 'if', 'else', 'while']);
+const OPS = new Set(['+', '-', '*', '/', '(', ')', ',', '=', ';', '{', '}', '<', '>']);
+// Two-character operators; must be matched BEFORE the single-character set.
+const OPS2 = new Set(['==', '!=', '<=', '>=']);
 
 class LexError extends Error {
   constructor(message, line, col) {
@@ -107,6 +110,17 @@ function tokenize(src) {
     }
 
     // --- operator / punctuation
+    // Two-character operators first so `==` is not scanned as two `=`.
+    const two = src.slice(i, i + 2);
+    if (OPS2.has(two)) {
+      tokens.push({ type: 'OP', value: two, line: startLine, col: startCol });
+      i += 2;
+      col += 2;
+      continue;
+    }
+    if (c === '!') {
+      throw new LexError(`expected '!=' but got ${JSON.stringify(src[i + 1] ?? 'end of input')}`, startLine, startCol);
+    }
     if (OPS.has(c)) {
       tokens.push({ type: 'OP', value: c, line: startLine, col: startCol });
       i++;

@@ -1,0 +1,14 @@
+{
+  "name": "mini-c-compiler",
+  "version": "0.1.0",
+  "description": "Hand-rolled mini C compiler: lexer + parser (AST) + x86_64 codegen",
+  "main": "src/index.js",
+  "bin": {
+    "minic": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/run_tests.js"
+  },
+  "license": "MIT"
+}

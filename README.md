@@ -164,7 +164,13 @@ gcc examples/funcs.s -o funcs && ./funcs; echo $?   # 期望 15
 ## Build
 
 ```bash
-gcc -O2 -o mini-c-compiler *.c
+npm install
+```
+
+## Run
+
+```bash
+npm start
 ```
 
 ## License

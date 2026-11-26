@@ -29,3 +29,12 @@ CMakeFiles/
 *.ilk
 *.exp
 /out/
+dist/
+out/
+.next/
+coverage/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+yarn-error.log
+*.tgz

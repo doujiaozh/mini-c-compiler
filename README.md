@@ -160,3 +160,13 @@ gcc examples/funcs.s -o funcs && ./funcs; echo $?   # 期望 15
 - 寄存器分配：当前每个二元运算独占一个 temp 槽，改为按需复用可缩小帧。
 - 编译期常量折叠等窥孔优化。
 - 更完善的错误恢复与多行诊断信息。
+
+## Build
+
+```bash
+gcc -O2 -o mini-c-compiler *.c
+```
+
+## License
+
+Released under the MIT license. See LICENSE for details.
